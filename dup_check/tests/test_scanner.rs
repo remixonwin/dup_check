@@ -1,5 +1,4 @@
-use dup_check::scanner::Scanner;
-use dup_check::utils;
+use dup_check::{scanner::Scanner, utils};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
