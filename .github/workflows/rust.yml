@@ -3,6 +3,7 @@ name: Rust CI/CD
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -13,7 +14,10 @@ env:
 jobs:
   build:
     name: Build and Test
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     defaults:
       run:
@@ -42,41 +46,50 @@ jobs:
     - name: Check formatting
       run: cargo fmt -- --check
 
+    - name: Build release binary
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo build --release
+
+    - name: Upload artifacts
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v3
+      with:
+        name: dup_check-${{ matrix.os }}
+        path: |
+          ${{ env.WORKING_DIRECTORY }}/target/release/dup_check
+          ${{ env.WORKING_DIRECTORY }}/target/release/dup_check.exe
+        if-no-files-found: ignore
+
   release:
     name: Create Release
     needs: build
-    runs-on: windows-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    
-    defaults:
-      run:
-        working-directory: ${{ env.WORKING_DIRECTORY }}
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
     
     steps:
     - uses: actions/checkout@v3
     
-    - name: Install latest rust toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-        default: true
-        override: true
-    
-    - name: Build release
-      run: cargo build --release
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Prepare release assets
+      run: |
+        mkdir release-assets
+        mv dup_check-windows-latest/dup_check.exe release-assets/dup_check-windows.exe || true
+        mv dup_check-ubuntu-latest/dup_check release-assets/dup_check-linux || true
+        mv dup_check-macos-latest/dup_check release-assets/dup_check-macos || true
+        chmod +x release-assets/dup_check-linux release-assets/dup_check-macos || true
     
     - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      uses: softprops/action-gh-release@v1
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
+        files: release-assets/*
         draft: false
         prerelease: false
         body: |
-          DupCheck ${{ github.ref }} - Safe Duplicate File Finder
+          DupCheck ${{ github.ref_name }} - Safe Duplicate File Finder
           
           ## Features
           - Fast file scanning with SHA-256 hash comparison
@@ -84,13 +97,8 @@ jobs:
           - Parallel processing using rayon
           - Safe file operations with Windows API integration
           - Progress tracking and detailed statistics
-    
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ${{ env.WORKING_DIRECTORY }}/target/release/dup_check.exe
-        asset_name: dup_check.exe
-        asset_content_type: application/octet-stream
+          
+          ## Downloads
+          - Windows: dup_check-windows.exe
+          - Linux: dup_check-linux
+          - macOS: dup_check-macos
