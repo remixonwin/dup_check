@@ -5,10 +5,13 @@ use std::{
     io::{BufReader, Read},
     path::Path,
 };
+
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{GetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 
 const BUFFER_SIZE: usize = 1024 * 1024; // 1MB buffer
 
+#[cfg(windows)]
 pub fn is_hidden(path: &Path) -> bool {
     let wide_path: Vec<u16> = path
         .to_string_lossy()
@@ -23,6 +26,19 @@ pub fn is_hidden(path: &Path) -> bool {
         }
         (attrs & FILE_ATTRIBUTE_HIDDEN.0) != 0
     }
+}
+
+#[cfg(unix)]
+pub fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.starts_with('.'))
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn is_hidden(_path: &Path) -> bool {
+    false // Default implementation for other platforms
 }
 
 pub fn calculate_hash(path: &Path) -> Result<String> {
