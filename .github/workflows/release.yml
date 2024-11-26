@@ -14,6 +14,8 @@ env:
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
       - uses: actions/checkout@v4
       - name: Create Release
@@ -92,12 +94,12 @@ jobs:
       - name: Compress binary
         if: matrix.platform.os != 'windows-latest'
         run: |
-          tar czf ${{ matrix.platform.asset_name }}.tar.gz target/${{ matrix.platform.target }}/release/dup_check
+          tar czf ../${{ matrix.platform.asset_name }}.tar.gz target/${{ matrix.platform.target }}/release/dup_check
 
       - name: Compress binary (Windows)
         if: matrix.platform.os == 'windows-latest'
         run: |
-          7z a ${{ matrix.platform.asset_name }}.zip target/release/dup_check.exe
+          7z a ../${{ matrix.platform.asset_name }}.zip target/release/dup_check.exe
 
       - name: Upload Release Asset (Unix)
         if: matrix.platform.os != 'windows-latest'
@@ -106,7 +108,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ matrix.platform.asset_name }}.tar.gz
+          asset_path: ../${{ matrix.platform.asset_name }}.tar.gz
           asset_name: ${{ matrix.platform.asset_name }}.tar.gz
           asset_content_type: application/gzip
 
@@ -117,6 +119,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ matrix.platform.asset_name }}.zip
+          asset_path: ../${{ matrix.platform.asset_name }}.zip
           asset_name: ${{ matrix.platform.asset_name }}.zip
           asset_content_type: application/zip
