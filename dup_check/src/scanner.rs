@@ -50,39 +50,26 @@ impl Scanner {
         // First pass: count total files for progress bar
         let total_files: u64 = WalkDir::new(path)
             .into_iter()
-            .filter_map(|e| match e {
-                Ok(entry) => {
-                    if self.should_process_file(&entry) {
-                        Some(1)
-                    } else {
-                        None
-                    }
-                }
-                Err(err) => {
-                    debug!("Error accessing file: {}", err);
-                    None
-                }
-            })
-            .sum();
+            .try_fold(0, |acc, entry| {
+                let entry = entry?;
+                Ok::<_, anyhow::Error>(if self.should_process_file(&entry) {
+                    acc + 1
+                } else {
+                    acc
+                })
+            })?;
 
         scan_progress.set_message(format!("Found {} files to process", total_files));
 
         // Second pass: collect files into size groups with progress
         let mut size_groups: HashMap<u64, Vec<FileInfo>> = HashMap::new();
         let mut processed = 0;
-        for entry in WalkDir::new(path).into_iter().filter_map(|e| match e {
-            Ok(entry) => {
-                if self.should_process_file(&entry) {
-                    Some(entry)
-                } else {
-                    None
-                }
+        for entry_result in WalkDir::new(path).into_iter() {
+            let entry = entry_result?;
+            if !self.should_process_file(&entry) {
+                continue;
             }
-            Err(err) => {
-                debug!("Error accessing file: {}", err);
-                None
-            }
-        }) {
+
             let metadata = entry.metadata()?;
             let size = metadata.len();
             size_groups
