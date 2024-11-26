@@ -21,7 +21,6 @@
 
 use anyhow::{Result, Context};
 use dup_check::{cli, scanner::Scanner, ui, interactive};
-use env_logger;
 use dialoguer::{theme::ColorfulTheme, Confirm};
 
 fn main() -> Result<()> {
