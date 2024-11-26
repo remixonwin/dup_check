@@ -1,5 +1,5 @@
 //! DupCheck - A Safe Duplicate File Finder
-//! 
+//!
 //! This utility helps users find and safely manage duplicate files in their system.
 //! It provides features like:
 //! - Scanning directories for duplicate files
@@ -7,11 +7,11 @@
 //! - Safe deletion of duplicates while preserving originals
 //! - Progress tracking and detailed statistics
 //! - Caching for improved performance
-//! 
+//!
 //! # Usage
 //! ```bash
 //! dupcheck [OPTIONS]
-//! 
+//!
 //! Options:
 //!   -p, --path <PATH>      Directory to scan (default: current directory)
 //!   -n, --min-size <SIZE>  Minimum file size (e.g., 1K, 1M)
@@ -19,14 +19,14 @@
 //!   -c, --no-cache        Disable hash caching
 //! ```
 
-use anyhow::{Result, Context};
-use dup_check::{cli, scanner::Scanner, ui, interactive};
+use anyhow::{Context, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm};
+use dup_check::{cli, interactive, scanner::Scanner, ui};
 
 fn main() -> Result<()> {
     env_logger::init();
     let theme = ColorfulTheme::default();
-    
+
     // Get configuration either from CLI args or interactive mode
     let mut config = if std::env::args().len() > 1 {
         // Use CLI args if provided
@@ -45,10 +45,11 @@ fn main() -> Result<()> {
     loop {
         let scanner = Scanner::new(config.use_cache, config.min_size, config.max_size)
             .context("Failed to initialize scanner")?;
-        
-        let duplicates = scanner.find_duplicates(config.path.as_path())
+
+        let duplicates = scanner
+            .find_duplicates(config.path.as_path())
             .context("Failed to scan for duplicates")?;
-        
+
         ui::display_duplicates(&duplicates);
 
         if !duplicates.is_empty() {
@@ -56,8 +57,7 @@ fn main() -> Result<()> {
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
             if input.trim().eq_ignore_ascii_case("y") {
-                ui::delete_duplicates(&duplicates)
-                    .context("Failed to delete duplicates")?;
+                ui::delete_duplicates(&duplicates).context("Failed to delete duplicates")?;
             }
         } else {
             println!("\nNo duplicates found!");

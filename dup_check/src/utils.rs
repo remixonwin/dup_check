@@ -15,7 +15,7 @@ pub fn is_hidden(path: &Path) -> bool {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    
+
     unsafe {
         let attrs = GetFileAttributesW(windows::core::PCWSTR::from_raw(wide_path.as_ptr()));
         if attrs == u32::MAX {

@@ -46,7 +46,7 @@ pub fn display_duplicates(duplicates: &HashMap<String, Vec<FileInfo>>) {
         let size = format_size(files[0].size);
         println!("Group {} (Size: {})", i + 1, size);
         println!("-------------------");
-        
+
         for (j, file) in files.iter().enumerate() {
             let symbol = if j == 0 { "🔒" } else { "📄" };
             println!("{} {}", symbol, file.path.display());

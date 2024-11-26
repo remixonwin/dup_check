@@ -42,15 +42,16 @@ fn parse_size(size_str: &str) -> Result<u64, String> {
 
     let (num_str, suffix) = if let Some(last_char) = size_str.chars().last() {
         match last_char {
-            'K' | 'M' | 'G' | 'T' => (&size_str[..len-1], last_char),
+            'K' | 'M' | 'G' | 'T' => (&size_str[..len - 1], last_char),
             '0'..='9' => (size_str.as_str(), 'B'),
-            _ => return Err(format!("Invalid size suffix: {}", last_char))
+            _ => return Err(format!("Invalid size suffix: {}", last_char)),
         }
     } else {
         return Err("Invalid size format".to_string());
     };
 
-    let base_size = num_str.parse::<u64>()
+    let base_size = num_str
+        .parse::<u64>()
         .map_err(|_| format!("Invalid number: {}", num_str))?;
 
     let multiplier = match suffix {
@@ -59,7 +60,7 @@ fn parse_size(size_str: &str) -> Result<u64, String> {
         'G' => 1024 * 1024 * 1024,
         'T' => 1024 * 1024 * 1024 * 1024,
         'B' => 1,
-        _ => return Err(format!("Invalid size suffix: {}", suffix))
+        _ => return Err(format!("Invalid size suffix: {}", suffix)),
     };
 
     Ok(base_size * multiplier)

@@ -1,7 +1,7 @@
-use std::path::PathBuf;
 use anyhow::Result;
-use dialoguer::{theme::ColorfulTheme, Select, Input, Confirm};
 use console::Term;
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use std::path::PathBuf;
 
 pub struct InteractiveConfig {
     pub path: PathBuf,
@@ -71,11 +71,11 @@ pub fn get_interactive_config() -> Result<InteractiveConfig> {
             .with_prompt("Set minimum file size?")
             .default(false)
             .interact()?;
-        
+
         let min_size = if use_min {
             let mut size_input;
             let mut parsed_size = None;
-            
+
             println!("\nEnter minimum size (e.g., 1MB, 500KB, 1.5GB):");
             while parsed_size.is_none() {
                 size_input = Input::<String>::with_theme(&theme)
@@ -88,7 +88,7 @@ pub fn get_interactive_config() -> Result<InteractiveConfig> {
                         }
                     })
                     .interact()?;
-                
+
                 parsed_size = parse_size(&size_input);
             }
             parsed_size
@@ -101,11 +101,11 @@ pub fn get_interactive_config() -> Result<InteractiveConfig> {
             .with_prompt("Set maximum file size?")
             .default(false)
             .interact()?;
-        
+
         let max_size = if use_max {
             let mut size_input;
             let mut parsed_size = None;
-            
+
             println!("\nEnter maximum size (e.g., 1MB, 500KB, 1.5GB):");
             while parsed_size.is_none() {
                 size_input = Input::<String>::with_theme(&theme)
@@ -118,7 +118,7 @@ pub fn get_interactive_config() -> Result<InteractiveConfig> {
                         }
                     })
                     .interact()?;
-                
+
                 parsed_size = parse_size(&size_input);
             }
             parsed_size
@@ -162,7 +162,7 @@ pub fn get_interactive_config() -> Result<InteractiveConfig> {
 fn select_directory(theme: &ColorfulTheme) -> Result<PathBuf> {
     let mut current_dir = std::env::current_dir()?;
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    
+
     loop {
         let mut entries = vec![
             String::from("📂 Select current directory"),
@@ -179,7 +179,10 @@ fn select_directory(theme: &ColorfulTheme) -> Result<PathBuf> {
         subdirs.sort();
 
         for subdir in &subdirs {
-            entries.push(format!("   {}", subdir.file_name().unwrap().to_string_lossy()));
+            entries.push(format!(
+                "   {}",
+                subdir.file_name().unwrap().to_string_lossy()
+            ));
         }
 
         println!("\nCurrent directory: {}", current_dir.display());
@@ -191,13 +194,15 @@ fn select_directory(theme: &ColorfulTheme) -> Result<PathBuf> {
 
         match selection {
             0 => return Ok(current_dir), // Select current directory
-            1 => { // Parent directory
+            1 => {
+                // Parent directory
                 if let Some(parent) = current_dir.parent() {
                     current_dir = parent.to_path_buf();
                 }
-            },
+            }
             2 => current_dir = home_dir.clone(), // Home directory
-            n => { // Selected subdirectory
+            n => {
+                // Selected subdirectory
                 let selected = &subdirs[n - 3];
                 current_dir = selected.clone();
             }

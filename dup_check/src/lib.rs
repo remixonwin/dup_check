@@ -1,27 +1,27 @@
 //! DupCheck - A safe and efficient duplicate file finder
-//! 
+//!
 //! This library provides functionality to find and manage duplicate files
 //! in a safe and efficient manner, using parallel processing and caching.
-//! 
+//!
 //! # Features
-//! 
+//!
 //! - Fast file scanning with SHA-256 hash comparison
 //! - SQLite-based caching for improved performance
 //! - Parallel processing using rayon
 //! - Safe file operations with Windows API integration
 //! - Progress tracking and detailed statistics
-//! 
+//!
 //! # Version
-//! 
+//!
 //! Current version: 0.1.0
 
 pub mod cache;
 pub mod cli;
+pub mod file_info;
+pub mod interactive;
 pub mod scanner;
 pub mod ui;
 pub mod utils;
-pub mod file_info;
-pub mod interactive;
 
 pub use cache::Cache;
 pub use cli::Args;
@@ -42,7 +42,7 @@ mod tests {
 
         let file1_path = temp_dir.path().join("file1.txt");
         let file2_path = temp_dir.path().join("file2.txt");
-        
+
         File::create(&file1_path)?.write_all(content)?;
         File::create(&file2_path)?.write_all(content)?;
 
