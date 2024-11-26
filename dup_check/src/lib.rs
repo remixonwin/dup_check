@@ -17,10 +17,11 @@
 
 pub mod cache;
 pub mod cli;
-pub mod file_info;
 pub mod scanner;
 pub mod ui;
 pub mod utils;
+pub mod file_info;
+pub mod interactive;
 
 pub use cache::Cache;
 pub use cli::Args;

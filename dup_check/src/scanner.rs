@@ -1,14 +1,12 @@
 use crate::{cache::Cache, file_info::FileInfo, utils};
 use anyhow::Result;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use log::debug;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    fs,
     path::Path,
     sync::Arc,
-    time::SystemTime,
 };
 use walkdir::WalkDir;
 
@@ -33,90 +31,137 @@ impl Scanner {
         })
     }
 
-    pub fn find_duplicates(&self, path: &str) -> Result<HashMap<String, Vec<FileInfo>>> {
-        let progress = ProgressBar::new_spinner();
-        progress.set_style(
-            indicatif::ProgressStyle::default_spinner()
+    pub fn find_duplicates(&self, path: &Path) -> Result<HashMap<String, Vec<FileInfo>>> {
+        let multi_progress = MultiProgress::new();
+        
+        // File scanning progress
+        let scan_progress = multi_progress.add(ProgressBar::new_spinner());
+        scan_progress.set_style(
+            ProgressStyle::default_spinner()
                 .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                .unwrap(),
+                .unwrap()
         );
-        progress.set_message("Scanning files...");
+        scan_progress.set_message("Collecting files...");
 
-        // First, collect all files into size groups
+        // First pass: count total files for progress bar
+        let total_files: u64 = WalkDir::new(path)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| self.should_process_file(e))
+            .count() as u64;
+
+        scan_progress.set_message(format!("Found {} files to process", total_files));
+
+        // Second pass: collect files into size groups with progress
         let mut size_groups: HashMap<u64, Vec<FileInfo>> = HashMap::new();
+        let mut processed = 0;
         for entry in WalkDir::new(path)
             .into_iter()
             .filter_map(Result::ok)
             .filter(|e| self.should_process_file(e))
         {
-            let size = entry.metadata()?.len();
-            size_groups
-                .entry(size)
-                .or_default()
-                .push(FileInfo::new(entry.path().to_owned(), size));
+            let metadata = entry.metadata()?;
+            let size = metadata.len();
+            size_groups.entry(size).or_default().push(FileInfo::new(
+                entry.path().to_path_buf(),
+                size,
+            ));
+            
+            processed += 1;
+            if processed % 100 == 0 || processed == total_files {
+                scan_progress.set_message(format!("Processed {}/{} files", processed, total_files));
+            }
         }
 
-        progress.set_message("Calculating hashes...");
-        
-        // Process files in parallel and collect results
-        let cache = self.cache.clone();
+        scan_progress.finish_with_message(format!("Processed {} files", total_files));
+
+        // Hash calculation progress
+        let hash_progress = multi_progress.add(ProgressBar::new_spinner());
+        hash_progress.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} [{elapsed_precise}] {msg}")
+                .unwrap()
+        );
+        hash_progress.set_message("Analyzing potential duplicates...");
+
+        // Count potential duplicates for progress
+        let potential_duplicates: usize = size_groups
+            .values()
+            .filter(|files| files.len() > 1)
+            .map(|files| files.len())
+            .sum();
+
+        hash_progress.set_message(format!("Found {} files in duplicate size groups", potential_duplicates));
+
+        // Process files in parallel and collect duplicates
         let duplicates: HashMap<String, Vec<FileInfo>> = size_groups
-            .into_iter()
-            .filter(|(_, files)| files.len() > 1)
-            .collect::<Vec<_>>()
             .into_par_iter()
-            .map(move |(_, files)| {
+            .filter(|(_, files)| files.len() > 1)
+            .map(|(_, files)| {
                 let mut hash_groups: HashMap<String, Vec<FileInfo>> = HashMap::new();
                 for file in files {
-                    if let Ok(hash) = Self::calculate_hash_cached(&file.path, file.size, cache.as_ref()) {
-                        let mut file = file.clone();
-                        file.hash = Some(hash.clone());
+                    if let Ok(hash) = Self::calculate_hash_cached(&file.path, file.size, self.cache.as_ref()) {
                         hash_groups.entry(hash).or_default().push(file);
                     }
                 }
                 hash_groups.into_iter()
-                    .filter(|(_, files)| files.len() > 1)
+                    .filter(|(_, group)| group.len() > 1)
                     .collect::<Vec<_>>()
+            })
+            .inspect(|groups| {
+                if !groups.is_empty() {
+                    hash_progress.set_message(format!("Found {} duplicate groups", groups.len()));
+                }
             })
             .flatten()
             .collect();
 
-        progress.finish_with_message("Scan complete");
+        hash_progress.finish_with_message(format!("Found {} duplicate groups", duplicates.len()));
+        
         Ok(duplicates)
     }
 
     fn should_process_file(&self, entry: &walkdir::DirEntry) -> bool {
-        if entry.file_type().is_dir() || utils::is_hidden(entry.path()) {
+        if !entry.file_type().is_file() {
             return false;
         }
 
-        match entry.metadata() {
-            Ok(metadata) => {
-                let size = metadata.len();
-                self.min_size.map_or(true, |min| size >= min)
-                    && self.max_size.map_or(true, |max| size <= max)
+        if utils::is_hidden(entry.path()) {
+            return false;
+        }
+
+        if let Ok(metadata) = entry.metadata() {
+            let size = metadata.len();
+            if let Some(min_size) = self.min_size {
+                if size < min_size {
+                    return false;
+                }
             }
-            Err(_) => false,
+            if let Some(max_size) = self.max_size {
+                if size > max_size {
+                    return false;
+                }
+            }
+            true
+        } else {
+            false
         }
     }
 
     fn calculate_hash_cached(path: &Path, size: u64, cache: Option<&Arc<Cache>>) -> Result<String> {
         if let Some(cache) = cache {
-            let modified = fs::metadata(path)?
-                .modified()?
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
-
-            if let Some(cached_hash) = cache.get_hash(path, size, modified)? {
+            if let Some(hash) = cache.get_hash(path, size)? {
                 debug!("Cache hit for {}", path.display());
-                return Ok(cached_hash);
+                return Ok(hash);
             }
-
-            let hash = utils::calculate_hash(path)?;
-            cache.insert_hash(path, size, modified, &hash)?;
-            Ok(hash)
-        } else {
-            utils::calculate_hash(path)
         }
+
+        let hash = utils::calculate_hash(path)?;
+        
+        if let Some(cache) = cache {
+            cache.store_hash(path, size, &hash)?;
+        }
+
+        Ok(hash)
     }
 }

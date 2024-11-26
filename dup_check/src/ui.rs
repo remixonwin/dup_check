@@ -1,71 +1,85 @@
-use crate::{file_info::FileInfo, utils::format_size};
+use crate::file_info::FileInfo;
 use anyhow::Result;
-use std::{collections::HashMap, fs, io::{self, Write}};
+use console::Term;
+use std::collections::HashMap;
+
+fn format_size(size: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut size = size as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{:.0} {}", size, UNITS[unit_index])
+    } else {
+        format!("{:.2} {}", size, UNITS[unit_index])
+    }
+}
 
 pub fn display_duplicates(duplicates: &HashMap<String, Vec<FileInfo>>) {
     if duplicates.is_empty() {
-        println!("No duplicates found.");
+        println!("\n✨ No duplicates found!");
         return;
     }
 
+    let term = Term::stdout();
+    let _ = term.clear_screen();
+
     let total_groups = duplicates.len();
     let total_files: usize = duplicates.values().map(|files| files.len()).sum();
-    let wasted_space: u64 = duplicates
+    let total_wasted: u64 = duplicates
         .values()
         .map(|files| files[0].size * (files.len() as u64 - 1))
         .sum();
 
-    println!("\nDuplicate files found:");
-    println!("----------------------");
-    println!("Total groups: {}", total_groups);
-    println!("Total duplicate files: {}", total_files);
-    println!("Wasted space: {}", format_size(wasted_space));
-    println!();
+    println!("\n📊 Duplicate Files Summary");
+    println!("========================");
+    println!("🔍 Found {} duplicate groups", total_groups);
+    println!("📁 Total duplicate files: {}", total_files);
+    println!("💾 Wasted space: {}\n", format_size(total_wasted));
 
-    for (hash, files) in duplicates.iter() {
-        println!("Hash: {}", hash);
-        println!("Size: {}", format_size(files[0].size));
-        for (i, file) in files.iter().enumerate() {
-            println!("{}: {}", i + 1, file.path.display());
+    for (i, (_, files)) in duplicates.iter().enumerate() {
+        let size = format_size(files[0].size);
+        println!("Group {} (Size: {})", i + 1, size);
+        println!("-------------------");
+        
+        for (j, file) in files.iter().enumerate() {
+            let symbol = if j == 0 { "🔒" } else { "📄" };
+            println!("{} {}", symbol, file.path.display());
         }
         println!();
     }
+
+    println!("Legend:");
+    println!("🔒 Original file (will be kept)");
+    println!("📄 Duplicate file (can be deleted)");
 }
 
 pub fn delete_duplicates(duplicates: &HashMap<String, Vec<FileInfo>>) -> Result<()> {
-    for (hash, files) in duplicates {
-        println!("\nDuplicate group (hash: {}):", hash);
-        for (i, file) in files.iter().enumerate() {
-            println!("{}: {}", i + 1, file.path.display());
-        }
+    let mut total_deleted = 0;
+    let mut space_freed = 0u64;
 
-        println!("\nEnter the number of the file to keep (1-{}), or 's' to skip: ", files.len());
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        let input = input.trim();
-        if input.eq_ignore_ascii_case("s") {
-            continue;
-        }
-
-        if let Ok(keep_index) = input.parse::<usize>() {
-            if keep_index >= 1 && keep_index <= files.len() {
-                for (i, file) in files.iter().enumerate() {
-                    if i != keep_index - 1 {
-                        match fs::remove_file(&file.path) {
-                            Ok(_) => println!("Deleted: {}", file.path.display()),
-                            Err(e) => eprintln!("Failed to delete {}: {}", file.path.display(), e),
-                        }
-                    }
-                }
+    for files in duplicates.values() {
+        // Skip the first file (original)
+        for file in files.iter().skip(1) {
+            if std::fs::remove_file(&file.path).is_ok() {
+                total_deleted += 1;
+                space_freed += file.size;
+                println!("✅ Deleted: {}", file.path.display());
             } else {
-                println!("Invalid input. Skipping this group.");
+                println!("❌ Failed to delete: {}", file.path.display());
             }
-        } else {
-            println!("Invalid input. Skipping this group.");
         }
     }
+
+    println!("\n🧹 Cleanup Summary");
+    println!("================");
+    println!("✨ Deleted {} duplicate files", total_deleted);
+    println!("💾 Freed up {}", format_size(space_freed));
+
     Ok(())
 }

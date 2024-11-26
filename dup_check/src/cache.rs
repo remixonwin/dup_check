@@ -1,41 +1,56 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use directories::ProjectDirs;
-use rusqlite::{params, Connection};
-use std::{fs, path::Path, sync::{Arc, Mutex}};
+use log::debug;
+use rusqlite::{params, Connection, OpenFlags};
+use std::{
+    fs,
+    path::Path,
+    sync::Mutex,
+};
 
 pub struct Cache {
-    conn: Arc<Mutex<Connection>>,
+    conn: Mutex<Connection>,
 }
 
 impl Cache {
     pub fn new() -> Result<Self> {
         let project_dirs = ProjectDirs::from("com", "dupcheck", "DupCheck")
-            .context("Failed to get project directories")?;
+            .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
+        
         let cache_dir = project_dirs.cache_dir();
-        fs::create_dir_all(cache_dir).context("Failed to create cache directory")?;
+        fs::create_dir_all(cache_dir)?;
+        
         let db_path = cache_dir.join("cache.db");
+        debug!("Using cache database at: {}", db_path.display());
+        
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
 
-        let conn = Connection::open(db_path)?;
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS file_cache (
+            "CREATE TABLE IF NOT EXISTS file_hashes (
                 path TEXT PRIMARY KEY,
                 size INTEGER NOT NULL,
-                modified INTEGER NOT NULL,
                 hash TEXT NOT NULL
             )",
             [],
         )?;
 
         Ok(Cache {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Mutex::new(conn),
         })
     }
 
-    pub fn get_hash(&self, path: &Path, size: u64, modified: u64) -> Result<Option<String>> {
+    pub fn get_hash(&self, path: &Path, size: u64) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
-        let result = conn.query_row(
-            "SELECT hash FROM file_cache WHERE path = ? AND size = ? AND modified = ?",
-            params![path.to_string_lossy(), size, modified],
+        let mut stmt = conn.prepare(
+            "SELECT hash FROM file_hashes WHERE path = ? AND size = ?",
+        )?;
+
+        let path_str = path.to_string_lossy();
+        let result = stmt.query_row(
+            params![path_str.as_ref(), size],
             |row| row.get::<_, String>(0),
         );
 
@@ -46,21 +61,15 @@ impl Cache {
         }
     }
 
-    pub fn insert_hash(&self, path: &Path, size: u64, modified: u64, hash: &str) -> Result<()> {
+    pub fn store_hash(&self, path: &Path, size: u64, hash: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let path_str = path.to_string_lossy();
+        
         conn.execute(
-            "INSERT OR REPLACE INTO file_cache (path, size, modified, hash) VALUES (?, ?, ?, ?)",
-            params![path.to_string_lossy(), size, modified, hash],
+            "INSERT OR REPLACE INTO file_hashes (path, size, hash) VALUES (?, ?, ?)",
+            params![path_str.as_ref(), size, hash],
         )?;
-        Ok(())
-    }
 
-    pub fn clean_old_entries(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM file_cache WHERE path NOT IN (SELECT path FROM file_cache WHERE 1=0)",
-            [],
-        )?;
         Ok(())
     }
 }
