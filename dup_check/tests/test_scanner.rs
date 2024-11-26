@@ -102,8 +102,28 @@ fn test_scanner_with_hidden_files() {
     let content = b"Duplicate content";
     create_temp_file(&temp_dir, "visible1.txt", content);
     create_temp_file(&temp_dir, "visible2.txt", content);
-    create_temp_file(&temp_dir, ".hidden1", content);
-    create_temp_file(&temp_dir, ".hidden2", content);
+    
+    // Create hidden files with proper Windows hidden attribute
+    let hidden1 = create_temp_file(&temp_dir, "hidden1.txt", content);
+    let hidden2 = create_temp_file(&temp_dir, "hidden2.txt", content);
+    
+    // Set hidden attribute on Windows
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
+        for path in &[hidden1, hidden2] {
+            let wide_path: Vec<u16> = path.to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe {
+                SetFileAttributesW(
+                    windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
+                    FILE_ATTRIBUTE_HIDDEN
+                );
+            }
+        }
+    }
     
     let scanner = Scanner::new(false, None, None).unwrap();
     let duplicates = scanner.find_duplicates(temp_dir.path()).unwrap();
@@ -113,8 +133,7 @@ fn test_scanner_with_hidden_files() {
     for (_, files) in duplicates {
         assert_eq!(files.len(), 2, "Should only find visible duplicate files");
         for file in files {
-            assert!(!file.path.file_name().unwrap().to_string_lossy().starts_with('.'),
-                   "Hidden files should be excluded");
+            assert!(!utils::is_hidden(&file.path), "Hidden files should be excluded");
         }
     }
 }
