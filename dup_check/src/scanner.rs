@@ -32,6 +32,11 @@ impl Scanner {
     }
 
     pub fn find_duplicates(&self, path: &Path) -> Result<HashMap<String, Vec<FileInfo>>> {
+        // Check if the directory exists first
+        if !path.exists() {
+            return Err(anyhow::anyhow!("Directory does not exist: {}", path.display()));
+        }
+
         let multi_progress = MultiProgress::new();
         
         // File scanning progress
@@ -46,9 +51,20 @@ impl Scanner {
         // First pass: count total files for progress bar
         let total_files: u64 = WalkDir::new(path)
             .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| self.should_process_file(e))
-            .count() as u64;
+            .filter_map(|e| match e {
+                Ok(entry) => {
+                    if self.should_process_file(&entry) {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    debug!("Error accessing file: {}", err);
+                    None
+                }
+            })
+            .sum();
 
         scan_progress.set_message(format!("Found {} files to process", total_files));
 
@@ -57,8 +73,19 @@ impl Scanner {
         let mut processed = 0;
         for entry in WalkDir::new(path)
             .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| self.should_process_file(e))
+            .filter_map(|e| match e {
+                Ok(entry) => {
+                    if self.should_process_file(&entry) {
+                        Some(entry)
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    debug!("Error accessing file: {}", err);
+                    None
+                }
+            })
         {
             let metadata = entry.metadata()?;
             let size = metadata.len();
