@@ -1,0 +1,883 @@
+//! DupCheck - A Safe Duplicate File Finder
+//! 
+//! This utility helps users find and safely manage duplicate files in their system.
+//! It provides features like:
+//! - Scanning directories for duplicate files
+//! - Filtering by file types
+//! - Safe deletion of duplicates while preserving originals
+//! - Progress tracking and detailed statistics
+//! 
+//! # Usage
+//! ```bash
+//! dupcheck [OPTIONS]
+//! ```
+//! 
+//! # Features
+//! - Interactive menu-driven interface
+//! - Support for multiple file type categories
+//! - Safe file deletion with Windows API
+//! - Progress bars and human-readable sizes
+//! - Configurable file type filters
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+use anyhow::{Context, Result, anyhow};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle, HumanBytes};
+use sha2::{Sha256, Digest};
+use walkdir::{WalkDir, DirEntry};
+use std::cell::RefCell;
+use rusqlite::{Connection, params};
+use directories::ProjectDirs;
+use std::sync::Arc;
+use rayon::prelude::*;
+use itertools::Itertools;
+
+/// Minimum file size to consider for duplicate checking (1KB)
+const MIN_FILE_SIZE: u64 = 1024;
+/// Interval for progress updates
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+/// Maximum path length for Windows
+const MAX_PATH_LENGTH: usize = 260;
+
+/// Predefined file type categories with their extensions
+const FILE_CATEGORIES: &[(&str, &[&str])] = &[
+    ("Images", &["jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp", "svg", "ico"]),
+    ("Videos", &["mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp"]),
+    ("Documents", &["pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "odt", "ods", "odp"]),
+    ("Audio", &["mp3", "wav", "flac", "m4a", "aac", "ogg", "wma"]),
+    ("Archives", &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"]),
+    ("Code", &["rs", "py", "js", "html", "css", "cpp", "c", "h", "java", "php", "rb", "go", "ts"]),
+];
+
+/// Thread-local storage for current file extension filter
+thread_local! {
+    static CURRENT_EXTENSIONS: RefCell<Option<Vec<String>>> = RefCell::new(None);
+}
+
+/// Command line arguments structure
+#[derive(Parser)]
+#[command(
+    name = "DupCheck",
+    about = "A safe duplicate file finder utility",
+    version,
+    author
+)]
+struct Cli {
+    /// Directory to scan for duplicates
+    #[arg(short, long)]
+    directory: Option<String>,
+
+    /// Comma-separated list of file extensions to scan
+    #[arg(short, long)]
+    extensions: Option<String>,
+
+    /// Skip confirmation prompts
+    #[arg(short, long)]
+    yes: bool,
+
+    /// Delete duplicate files (keeps one copy)
+    #[arg(short = 'r', long)]
+    delete: bool,
+
+    /// Automatically confirm deletion without prompting
+    #[arg(short = 'y', long)]
+    auto_confirm: bool,
+
+    /// Show predefined file type categories
+    #[arg(short = 'l', long)]
+    list_categories: bool,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+/// Information about a file being processed
+#[derive(Debug)]
+struct FileInfo {
+    /// Full path to the file
+    path: PathBuf,
+    /// Size of the file in bytes
+    size: u64,
+}
+
+/// File information with its hash
+#[derive(Debug, Clone)]
+struct FileEntry {
+    info: FileInfo,
+    hash: String,
+}
+
+/// Pure function to check if a file should be included
+fn should_include_file(entry: &DirEntry, allowed_extensions: &Option<Vec<String>>) -> bool {
+    entry.file_type().is_file() 
+    && match allowed_extensions {
+        Some(exts) if !exts.is_empty() => {
+            entry.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+                .unwrap_or(false)
+        }
+        _ => true
+    }
+}
+
+/// Pure function to get file metadata
+fn get_file_metadata(entry: &DirEntry) -> Option<(PathBuf, u64)> {
+    entry.metadata().ok().and_then(|metadata| {
+        let size = metadata.len();
+        if size >= MIN_FILE_SIZE {
+            Some((entry.path().to_path_buf(), size))
+        } else {
+            None
+        }
+    })
+}
+
+/// Pure function to process a single file
+fn process_file(path: PathBuf, size: u64, cache: &Cache) -> Option<FileEntry> {
+    calculate_hash_cached(&path, cache)
+        .ok()
+        .map(|hash| FileEntry {
+            info: FileInfo { path, size },
+            hash,
+        })
+}
+
+/// Checks if a file should be included based on its extension
+/// 
+/// # Arguments
+/// * `entry` - The directory entry to check
+/// * `allowed_extensions` - Optional list of allowed file extensions
+/// 
+/// # Returns
+/// `true` if the file should be included, `false` otherwise
+fn is_file_allowed(entry: &DirEntry, allowed_extensions: &Option<Vec<String>>) -> bool {
+    if let Some(extensions) = allowed_extensions {
+        if extensions.is_empty() {
+            return true; // If extensions list is empty, allow all files
+        }
+        entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| extensions.iter().any(|allowed| allowed.eq_ignore_ascii_case(ext)))
+            .unwrap_or(false)
+    } else {
+        true // If no extensions specified, allow all files
+    }
+}
+
+/// Safely deletes a file using Windows API
+/// 
+/// # Arguments
+/// * `path` - Path to the file to delete
+/// 
+/// # Returns
+/// Result indicating success or failure
+fn safe_delete_file(path: &Path) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    if path_str.len() > MAX_PATH_LENGTH {
+        return Err(anyhow!("Path too long: {}", path_str));
+    }
+
+    // Convert path to wide string for Windows API
+    let wide_path: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+    
+    unsafe {
+        let path_ptr = PCWSTR::from_raw(wide_path.as_ptr());
+        let handle = CreateFileW(
+            path_ptr,
+            (DELETE.0 | SYNCHRONIZE.0) as u32,  // Convert to raw u32
+            FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(null_mut()),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            HANDLE(0),
+        );
+
+        let handle = handle?;
+        if handle.is_invalid() {
+            return Err(anyhow!("Failed to open file for deletion: {}", path_str));
+        }
+        
+        let mut file_info = FILE_DISPOSITION_INFO { DeleteFile: BOOLEAN(1) };
+        let result = SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            &mut file_info as *mut _ as *mut _,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        );
+
+        CloseHandle(handle);
+
+        if result.as_bool() {
+            Ok(())
+        } else {
+            Err(anyhow!("Failed to delete file: {}", path_str))
+        }
+    }
+}
+
+/// Cache entry for file information
+#[derive(Debug)]
+struct CacheEntry {
+    path: String,
+    hash: String,
+    size: u64,
+    modified: u64,
+}
+
+/// Manages the cache database for file hashes
+struct Cache {
+    conn: Connection,
+}
+
+impl Cache {
+    /// Initialize the cache database
+    fn new() -> Result<Self> {
+        let proj_dirs = ProjectDirs::from("com", "dupcheck", "DupCheck")
+            .ok_or_else(|| anyhow!("Could not determine project directory"))?;
+        
+        let cache_dir = proj_dirs.cache_dir();
+        std::fs::create_dir_all(cache_dir)?;
+        let db_path = cache_dir.join("cache.db");
+
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY,
+                hash TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                modified INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        Ok(Cache { conn })
+    }
+
+    /// Get cached file information
+    fn get(&self, path: &str) -> Result<Option<CacheEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, hash, size, modified FROM files WHERE path = ?"
+        )?;
+        
+        let mut rows = stmt.query(params![path])?;
+        
+        if let Some(row) = rows.next()? {
+            Ok(Some(CacheEntry {
+                path: row.get(0)?,
+                hash: row.get(1)?,
+                size: row.get(2)?,
+                modified: row.get(3)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update or insert file information in cache
+    fn put(&self, entry: &CacheEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO files (path, hash, size, modified) VALUES (?, ?, ?, ?)",
+            params![entry.path, entry.hash, entry.size, entry.modified],
+        )?;
+        Ok(())
+    }
+
+    /// Clear old entries from cache
+    fn cleanup(&self) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM files WHERE path NOT IN (SELECT path FROM files ORDER BY modified DESC LIMIT 100000)",
+            [],
+        )?;
+        Ok(removed)
+    }
+}
+
+/// Calculates SHA-256 hash of a file
+/// 
+/// # Arguments
+/// * `path` - Path to the file
+/// 
+/// # Returns
+/// Hex string of the file's hash
+fn calculate_hash<P: AsRef<Path>>(path: P) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = Vec::with_capacity(1024 * 1024);
+    
+    File::open(path.as_ref())?
+        .read_to_end(&mut buffer)
+        .map(|_| {
+            hasher.update(&buffer);
+            format!("{:x}", hasher.finalize())
+        })
+        .context("Failed to read file for hashing")
+}
+
+/// Calculate file hash with caching
+fn calculate_hash_cached(path: &Path, cache: &Cache) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    let modified = metadata.modified()?
+        .duration_since(SystemTime::UNIX_EPOCH)?
+        .as_secs();
+    
+    // Check cache first
+    if let Some(entry) = cache.get(path.to_str().unwrap_or_default())? {
+        if entry.modified == modified && entry.size == metadata.len() {
+            return Ok(entry.hash);
+        }
+    }
+    
+    // Calculate hash if not in cache or modified
+    let hash = calculate_hash(path)?;
+    
+    // Update cache
+    cache.put(&CacheEntry {
+        path: path.to_str().unwrap_or_default().to_string(),
+        hash: hash.clone(),
+        size: metadata.len(),
+        modified,
+    })?;
+    
+    Ok(hash)
+}
+
+/// Counts total files and their combined size in a directory
+/// 
+/// # Arguments
+/// * `dir` - Directory to scan
+/// * `allowed_extensions` - Optional list of allowed file extensions
+/// 
+/// # Returns
+/// Tuple of (file count, total size in bytes)
+fn count_files_and_size(dir: &str, allowed_extensions: &Option<Vec<String>>) -> (u64, u64) {
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && is_file_allowed(e, allowed_extensions))
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.len() >= MIN_FILE_SIZE)
+        .fold((0, 0), |(files, size), metadata| {
+            (files + 1, size + metadata.len())
+        })
+}
+
+/// Find duplicate files using functional approach
+fn find_duplicates(
+    dir: &str,
+    pb: &ProgressBar,
+    allowed_extensions: &Option<Vec<String>>,
+    cache: &Cache,
+) -> Result<HashMap<String, Vec<FileInfo>>> {
+    // Get initial file count for progress
+    let (total_files, total_size) = count_files_and_size(dir, allowed_extensions);
+    pb.set_length(total_files);
+    
+    println!("\nScanning directory: {}", dir);
+    println!("Total files to scan: {}", total_files);
+    println!("Total size: {}", HumanBytes(total_size));
+
+    // Process files in parallel using functional operations
+    let duplicates: HashMap<String, Vec<FileInfo>> = WalkDir::new(dir)
+        .into_iter()
+        .par_bridge() // Enable parallel processing
+        .filter_map(Result::ok)
+        .filter(|entry| should_include_file(entry, allowed_extensions))
+        .filter_map(|entry| get_file_metadata(&entry))
+        .filter_map(|(path, size)| {
+            let cache = Arc::clone(&cache);
+            process_file(path, size, &cache).map(|entry| {
+                pb.inc(1);
+                entry
+            })
+        })
+        .fold(
+            || HashMap::new(),
+            |mut acc, entry| {
+                acc.entry(entry.hash)
+                    .or_default()
+                    .push(entry.info);
+                acc
+            },
+        )
+        .reduce(
+            || HashMap::new(),
+            |mut acc1, acc2| {
+                acc2.into_iter().for_each(|(hash, files)| {
+                    acc1.entry(hash)
+                        .or_default()
+                        .extend(files);
+                });
+                acc1
+            },
+        );
+
+    // Filter duplicates using functional operations
+    let result = duplicates
+        .into_iter()
+        .filter(|(_, files)| files.len() > 1)
+        .map(|(hash, mut files)| {
+            // Sort files by path for consistent ordering
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            (hash, files)
+        })
+        .collect();
+
+    // Cleanup cache in background
+    rayon::spawn(move || {
+        if let Ok(removed) = cache.cleanup() {
+            println!("Cleaned up {} old cache entries", removed);
+        }
+    });
+
+    Ok(result)
+}
+
+/// Pure function to group duplicates by extension
+fn group_duplicates_by_extension(duplicates: &HashMap<String, Vec<FileInfo>>) -> HashMap<String, (usize, u64)> {
+    duplicates
+        .values()
+        .flat_map(|files| {
+            files.iter().skip(1).filter_map(|file| {
+                file.path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| (ext.to_lowercase(), (1_usize, file.size)))
+            })
+        })
+        .fold(HashMap::new(), |mut acc, (ext, (count, size))| {
+            let entry = acc.entry(ext).or_insert((0, 0));
+            entry.0 += count;
+            entry.1 += size;
+            acc
+        })
+}
+
+/// Pure function to calculate total duplicate statistics
+fn calculate_duplicate_stats(duplicates: &HashMap<String, Vec<FileInfo>>) -> (usize, u64) {
+    duplicates.values().fold((0, 0), |(total_files, total_size), files| {
+        let duplicate_count = files.len() - 1;
+        let duplicate_size = files[0].size * (duplicate_count as u64);
+        (total_files + duplicate_count, total_size + duplicate_size)
+    })
+}
+
+/// Display duplicate results in a functional way
+fn display_duplicates(duplicates: &HashMap<String, Vec<FileInfo>>) {
+    if duplicates.is_empty() {
+        println!("\nNo duplicates found!");
+        return;
+    }
+
+    // Display duplicate groups
+    duplicates
+        .iter()
+        .sorted_by_key(|(_, files)| files[0].size)
+        .for_each(|(hash, files)| {
+            println!("\nDuplicate group ({})", hash);
+            files.iter().enumerate().for_each(|(i, file)| {
+                let prefix = if i == 0 { "Original" } else { "Duplicate" };
+                println!("  {}: {} ({} bytes)", 
+                    prefix,
+                    file.path.display(),
+                    file.size
+                );
+            });
+        });
+
+    // Display statistics
+    let (total_files, total_size) = calculate_duplicate_stats(duplicates);
+    let by_extension = group_duplicates_by_extension(duplicates);
+
+    println!("\nDuplicates by file type:");
+    by_extension
+        .iter()
+        .sorted_by_key(|(_, (count, _))| *count)
+        .for_each(|(ext, (count, size))| {
+            println!("*.{}: {} files ({} wasted)", ext, count, HumanBytes(*size));
+        });
+
+    println!("\nTotal space wasted by duplicates: {}", HumanBytes(total_size));
+    println!("Total duplicate files: {}", total_files);
+}
+
+/// Prompts for user confirmation before deletion
+/// 
+/// # Arguments
+/// * `count` - Number of files to delete
+/// * `size` - Total size of files to delete
+/// 
+/// # Returns
+/// `true` if user confirms, `false` otherwise
+fn confirm_deletion(count: usize, size: u64) -> Result<bool> {
+    println!("\nWARNING: You are about to delete {} duplicate files, saving {} of space.", 
+        count, 
+        HumanBytes(size)
+    );
+    println!("This action cannot be undone!");
+    print!("Are you sure you want to proceed? [y/N]: ");
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let response = input.trim().to_lowercase();
+    
+    Ok(response == "y" || response == "yes")
+}
+
+/// Deletes duplicate files, keeping the first one in each group
+/// 
+/// # Arguments
+/// * `duplicates` - HashMap of duplicate file groups
+/// * `pb` - Progress bar for tracking
+/// 
+/// # Returns
+/// Tuple of (successfully deleted count, failed deletion count)
+fn delete_duplicates(duplicates: &HashMap<String, Vec<FileInfo>>, pb: &ProgressBar) -> Result<(usize, usize)> {
+    let mut successful = 0;
+    let mut failed = 0;
+
+    for files in duplicates.values() {
+        // Skip the first file (keep it as original)
+        for file in files.iter().skip(1) {
+            match safe_delete_file(&file.path) {
+                Ok(_) => {
+                    successful += 1;
+                    pb.set_message(format!("Deleted: {}", file.path.display()));
+                },
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("Failed to delete {}: {}", file.path.display(), e);
+                }
+            }
+            pb.inc(1);
+        }
+    }
+
+    Ok((successful, failed))
+}
+
+/// Shows available file type categories
+fn show_categories() {
+    println!("\nAvailable file type categories:");
+    println!("0. All Files (no extension filter)");
+    for (i, (category, extensions)) in FILE_CATEGORIES.iter().enumerate() {
+        println!("{}. {} ({:?})", i + 1, category, extensions);
+    }
+}
+
+/// Prompts user to select file type categories
+/// 
+/// # Returns
+/// Optional vector of selected file extensions
+fn prompt_for_categories() -> Result<Option<Vec<String>>> {
+    show_categories();
+    println!("\nEnter category numbers separated by spaces (or press Enter to select all files):");
+    print!("> ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        return Ok(None); // No filter - scan all files
+    }
+
+    let mut extensions = Vec::new();
+    for num_str in input.split_whitespace() {
+        match num_str.parse::<usize>() {
+            Ok(0) => return Ok(None), // All files selected
+            Ok(num) if num <= FILE_CATEGORIES.len() => {
+                extensions.extend(FILE_CATEGORIES[num - 1].1.iter().map(|&s| s.to_string()));
+            }
+            _ => {
+                println!("Invalid category number: {}", num_str);
+                return prompt_for_categories();
+            }
+        }
+    }
+
+    Ok(Some(extensions))
+}
+
+/// Prompts user for directory path
+/// 
+/// # Returns
+/// Validated directory path
+fn prompt_for_directory() -> Result<String> {
+    println!("\nPlease enter the directory path to scan:");
+    print!("> ");
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    
+    // Remove quotes and whitespace
+    let path = input.trim().trim_matches('"').to_string();
+    
+    // Validate the path
+    if Path::new(&path).is_dir() {
+        Ok(path)
+    } else {
+        Err(anyhow!("Directory does not exist: {}", path))
+    }
+}
+
+/// Shows main menu options
+fn show_menu() {
+    println!("\nDuplicate File Finder - Main Menu");
+    println!("1. Scan new directory");
+    println!("2. Change file types (current: {})", 
+        if CURRENT_EXTENSIONS.with(|ext| ext.borrow().is_none()) {
+            "All Files".to_string()
+        } else {
+            CURRENT_EXTENSIONS.with(|ext| {
+                ext.borrow()
+                    .as_ref()
+                    .map(|v| v.join(", "))
+                    .unwrap_or_default()
+            })
+        });
+    println!("3. Show current results");
+    println!("4. Delete duplicates (current file types only)");
+    println!("5. Delete ALL duplicates (all file types)");
+    println!("6. Exit");
+    print!("\nSelect an option (1-6): ");
+    io::stdout().flush().unwrap();
+}
+
+/// Prompts for menu option selection
+/// 
+/// # Returns
+/// Selected menu option number
+fn prompt_for_menu_option() -> Result<u32> {
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let num = input.trim().parse()?;
+    if num < 1 || num > 6 {
+        println!("Please enter a number between 1 and 6");
+        return prompt_for_menu_option();
+    }
+    Ok(num)
+}
+
+/// Main program entry point
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    
+    // Initialize logging
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .filter_level(if cli.verbose { log::LevelFilter::Info } else { log::LevelFilter::Warn })
+        .init();
+
+    info!("Starting DupCheck utility");
+    
+    if cli.list_categories {
+        show_categories();
+        return Ok(());
+    }
+
+    let mut current_dir = if let Some(dir) = cli.directory {
+        dir
+    } else {
+        prompt_for_directory()?
+    };
+
+    let mut current_extensions = if let Some(ext) = cli.extensions {
+        ext.split(',')
+            .map(|s| s.trim().to_string())
+            .collect::<Vec<_>>()
+    } else {
+        prompt_for_categories()?.unwrap_or_default()
+    };
+
+    let mut current_duplicates: Option<HashMap<String, Vec<FileInfo>>> = None;
+    
+    let cache = Cache::new()?;
+    
+    loop {
+        show_menu();
+        
+        let menu_choice = prompt_for_menu_option()?;
+        match menu_choice {
+            1 => {
+                // Scan new directory
+                current_dir = prompt_for_directory()?;
+                current_extensions = prompt_for_categories()?.unwrap_or_default();
+                current_duplicates = None;
+            },
+            2 => {
+                // Change file types
+                current_extensions = prompt_for_categories()?.unwrap_or_default();
+                current_duplicates = None;
+            },
+            3 | 4 | 5 => {
+                // Scan if no current results or if deleting all types (option 5)
+                let scan_all = menu_choice == 5;
+                if current_duplicates.is_none() || scan_all {
+                    // Create longer-lived values for the extensions
+                    let extensions_for_scan = if scan_all {
+                        None
+                    } else {
+                        Some(current_extensions.clone())
+                    };
+
+                    let (total_files, total_size) = count_files_and_size(&current_dir, &extensions_for_scan);
+                    
+                    println!("\nScanning directory: {}", current_dir);
+                    println!("Total files to scan: {}", total_files);
+                    println!("Total size: {}", HumanBytes(total_size));
+                    
+                    let pb = ProgressBar::new(total_files);
+                    pb.set_style(ProgressStyle::default_bar()
+                        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                        .unwrap()
+                        .progress_chars("#>-")
+                    );
+                    
+                    current_duplicates = Some(find_duplicates(&current_dir, &pb, &extensions_for_scan, &cache)?);
+                    pb.finish_and_clear();
+                }
+
+                if let Some(ref duplicates) = current_duplicates {
+                    if duplicates.is_empty() {
+                        println!("\nNo duplicates found!");
+                        continue;
+                    }
+
+                    let mut total_size = 0;
+                    let mut total_files = 0;
+                    
+                    println!("\nDuplicate files found:");
+                    for (hash, files) in duplicates.iter() {
+                        if files.len() > 1 {
+                            println!("\nDuplicate group ({})", hash);
+                            for (i, file) in files.iter().enumerate() {
+                                if i == 0 {
+                                    println!("  Original: {} ({} bytes)", file.path.display(), file.size);
+                                } else {
+                                    println!("  Duplicate {}: {} ({} bytes)", i, file.path.display(), file.size);
+                                    total_size += file.size;
+                                    total_files += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if menu_choice >= 4 {  // Only for delete options
+                        println!("\nTotal duplicate files: {}", total_files);
+                        println!("Total space that can be saved: {}", HumanBytes(total_size));
+
+                        if !cli.yes && !confirm_deletion(total_files, total_size)? {
+                            println!("Deletion cancelled.");
+                            println!("\nPress Enter to return to main menu...");
+                            let mut input = String::new();
+                            io::stdin().read_line(&mut input)?;
+                            continue;
+                        }
+
+                        println!("\nProceeding with deletion...");
+                        let pb = ProgressBar::new(total_files as u64);
+                        pb.set_style(ProgressStyle::default_bar()
+                            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.red/blue}] {pos}/{len} ({eta}) {msg}")
+                            .unwrap()
+                            .progress_chars("#>-"));
+
+                        let (deleted, failed) = delete_duplicates(duplicates, &pb)?;
+                        pb.finish_and_clear();
+
+                        println!("\nDeletion complete:");
+                        println!("Successfully deleted: {} files", deleted);
+                        if failed > 0 {
+                            println!("Failed to delete: {} files", failed);
+                        }
+
+                        println!("\nPress Enter to return to main menu...");
+                        let mut input = String::new();
+                        io::stdin().read_line(&mut input)?;
+                    } else {
+                        println!("\nPress Enter to return to main menu...");
+                        let mut input = String::new();
+                        io::stdin().read_line(&mut input)?;
+                    }
+                }
+            },
+            6 => {
+                println!("\nGoodbye!");
+                break;
+            },
+            _ => {
+                println!("Invalid option. Please try again.");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::create_dir_all;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_hash_calculation() {
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        
+        let mut file = File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+        
+        let hash = calculate_hash(&file_path).unwrap();
+        assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_detection() {
+        let temp_dir = tempdir().unwrap();
+        let content = b"test content";
+        
+        // Create two identical files
+        let file1_path = temp_dir.path().join("file1.txt");
+        let file2_path = temp_dir.path().join("file2.txt");
+        
+        File::create(&file1_path).unwrap().write_all(content).unwrap();
+        File::create(&file2_path).unwrap().write_all(content).unwrap();
+        
+        let pb = ProgressBar::new(0);
+        let duplicates = find_duplicates(temp_dir.path().to_str().unwrap(), &pb, &None, &Cache::new().unwrap()).unwrap();
+        
+        assert_eq!(duplicates.len(), 1); // One group of duplicates
+        assert_eq!(duplicates.values().next().unwrap().len(), 2); // Two files in the group
+    }
+
+    #[test]
+    fn test_extension_filter() {
+        let temp_dir = tempdir().unwrap();
+        let content = b"test content";
+        
+        // Create files with different extensions
+        let txt_file = temp_dir.path().join("file.txt");
+        let jpg_file = temp_dir.path().join("file.jpg");
+        
+        File::create(&txt_file).unwrap().write_all(content).unwrap();
+        File::create(&jpg_file).unwrap().write_all(content).unwrap();
+        
+        let allowed_extensions = Some(vec!["txt".to_string()]);
+        let (count, _) = count_files_and_size(
+            temp_dir.path().to_str().unwrap(),
+            &allowed_extensions
+        );
+        
+        assert_eq!(count, 1); // Only the .txt file should be counted
+    }
+}
