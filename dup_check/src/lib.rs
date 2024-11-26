@@ -47,7 +47,7 @@ mod tests {
         File::create(&file2_path)?.write_all(content)?;
 
         let scanner = Scanner::new(false, None, None)?;
-        let duplicates = scanner.find_duplicates(temp_dir.path().to_str().unwrap())?;
+        let duplicates = scanner.find_duplicates(temp_dir.path())?;
 
         assert_eq!(duplicates.len(), 1); // One group of duplicates
         assert_eq!(duplicates.values().next().unwrap().len(), 2); // Two files in the group
