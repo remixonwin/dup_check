@@ -94,8 +94,15 @@ fn test_calculate_hash_binary_file() {
 }
 
 #[test]
-#[should_panic(expected = "No such file or directory")]
 fn test_calculate_hash_nonexistent_file() {
     let nonexistent = PathBuf::from("/nonexistent/file.txt");
-    utils::calculate_hash(&nonexistent).unwrap();
+    let result = utils::calculate_hash(&nonexistent);
+    assert!(result.is_err(), "Expected an error for nonexistent file");
+    let err = result.unwrap_err();
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("cannot find") || err_msg.contains("No such file"),
+        "Unexpected error message: {}",
+        err_msg
+    );
 }
