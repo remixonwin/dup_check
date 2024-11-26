@@ -31,6 +31,9 @@ jobs:
     needs: create-release
     name: Build Release - ${{ matrix.platform.os }}
     runs-on: ${{ matrix.platform.os }}
+    defaults:
+      run:
+        working-directory: dup_check
     strategy:
       matrix:
         platform:
@@ -76,9 +79,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-      - name: Change to project directory
-        run: cd dup_check
-
       - name: Build binary
         uses: actions-rs/cargo@v1
         with:
@@ -92,16 +92,12 @@ jobs:
       - name: Compress binary
         if: matrix.platform.os != 'windows-latest'
         run: |
-          cd target/${{ matrix.platform.target }}/release
-          tar czf ../../../../${{ matrix.platform.asset_name }}.tar.gz dup_check
-          cd ../../../..
+          tar czf ${{ matrix.platform.asset_name }}.tar.gz target/${{ matrix.platform.target }}/release/dup_check
 
       - name: Compress binary (Windows)
         if: matrix.platform.os == 'windows-latest'
         run: |
-          cd target/release
-          7z a ../../../${{ matrix.platform.asset_name }}.zip dup_check.exe
-          cd ../../..
+          7z a ${{ matrix.platform.asset_name }}.zip target/release/dup_check.exe
 
       - name: Upload Release Asset (Unix)
         if: matrix.platform.os != 'windows-latest'
