@@ -76,13 +76,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
+      - name: Change to project directory
+        run: cd dup_check
+
       - name: Build binary
         uses: actions-rs/cargo@v1
         with:
           command: build
           args: --release --target ${{ matrix.platform.target }}
           use-cross: false
-        working-directory: ./dup_check
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           RUSTFLAGS: "-C target-feature=+crt-static"
@@ -90,14 +92,14 @@ jobs:
       - name: Compress binary
         if: matrix.platform.os != 'windows-latest'
         run: |
-          cd dup_check/target/${{ matrix.platform.target }}/release
+          cd target/${{ matrix.platform.target }}/release
           tar czf ../../../../${{ matrix.platform.asset_name }}.tar.gz dup_check
           cd ../../../..
 
       - name: Compress binary (Windows)
         if: matrix.platform.os == 'windows-latest'
         run: |
-          cd dup_check/target/release
+          cd target/release
           7z a ../../../${{ matrix.platform.asset_name }}.zip dup_check.exe
           cd ../../..
 
