@@ -26,7 +26,7 @@ fn parse_size(input: &str) -> Option<u64> {
     }
 
     // Parse the unit part
-    while let Some(c) = chars.next() {
+    for c in chars {
         if c.is_ascii_alphabetic() {
             unit.push(c);
         }
