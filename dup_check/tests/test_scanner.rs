@@ -111,16 +111,17 @@ fn test_scanner_with_hidden_files() {
     #[cfg(windows)]
     {
         use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
-        for path in &[hidden1, hidden2] {
+        for path in &[&hidden1, &hidden2] {
             let wide_path: Vec<u16> = path.to_string_lossy()
                 .encode_utf16()
                 .chain(std::iter::once(0))
                 .collect();
             unsafe {
-                SetFileAttributesW(
+                let result = SetFileAttributesW(
                     windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
                     FILE_ATTRIBUTE_HIDDEN
                 );
+                assert!(result.as_bool(), "Failed to set hidden attribute");
             }
         }
     }
