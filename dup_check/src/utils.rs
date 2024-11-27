@@ -21,10 +21,10 @@ pub fn is_hidden(path: &Path) -> bool {
 
     unsafe {
         let attrs = GetFileAttributesW(windows::core::PCWSTR::from_raw(wide_path.as_ptr()));
-        if attrs == u32::MAX {
+        if attrs.0 == u32::MAX {
             return false; // Error getting attributes
         }
-        (attrs & FILE_ATTRIBUTE_HIDDEN.0) != 0
+        (attrs.0 & FILE_ATTRIBUTE_HIDDEN.0) != 0
     }
 }
 
